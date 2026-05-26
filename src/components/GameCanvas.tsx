@@ -1,18 +1,20 @@
 import React, { useRef, useEffect, useState } from "react";
 import { sound } from "../sound";
-import { 
-  Position, 
-  Tile, 
-  TileType, 
-  Player, 
-  Enemy, 
-  Frog, 
-  KeyPickup, 
-  Chest, 
-  Artifact, 
-  Particle, 
+import { images } from "../assets";
+import {
+  Position,
+  Tile,
+  TileType,
+  Player,
+  Enemy,
+  Frog,
+  KeyPickup,
+  Chest,
+  Artifact,
+  Particle,
   FloatingText,
-  GameStatus
+  GameStatus,
+  ProgressionState
 } from "../types";
 
 interface GameCanvasProps {
@@ -71,6 +73,15 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   // Keyboard controls state
   const keysPressedRef = useRef<{ [key: string]: boolean }>({});
 
+  // Sprite animation states
+  const playerAnimRef = useRef({ frame: 0, timer: 0, isMoving: false });
+  const frogAnimRef = useRef({ hitTimer: 0 });
+  const enemiesAnimRef = useRef<Record<string, { frame: number, timer: number, isMoving: boolean }>>({});
+  const chestAnimRef = useRef<Record<string, { frame: number, timer: number, openAnimPlaying: boolean, openAnimDone: boolean }>>({});
+
+  // Progression State Machine
+  const progressionRef = useRef<ProgressionState>("SEARCHING_FOR_FROG");
+
   // Core Game entity references for physics looping
   const playerRef = useRef<Player>({
     x: 100,
@@ -93,7 +104,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   const frogRef = useRef<Frog>({
     x: 480,
     y: 360,
-    radius: 14,
+    radius: 20,
     hitsRequired: 2,
     escapesRemaining: 3,
     magicalCharge: 0
@@ -102,7 +113,14 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   const chestsRef = useRef<Chest[]>([]);
   const keyPickupsRef = useRef<KeyPickup[]>([]);
   const artifactRef = useRef<Artifact>({ x: 760, y: 360, collected: false, pulseTimer: 0 });
-  
+
+  // Tracks whether alert sound has been played this detection window (to avoid spam)
+  const alertSoundPlayedRef = useRef<boolean>(false);
+
+  // Detection grace period — gives player ~0.5s reaction window before panic builds
+  // Counts up each frame the player is in vision. Panic only starts after grace threshold.
+  const detectionGraceRef = useRef<number>(0);
+
   // Visual effect frames
   const particlesRef = useRef<Particle[]>([]);
   const floatingTextsRef = useRef<FloatingText[]>([]);
@@ -117,7 +135,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   // Generate deterministic grid with layout inspiration
   const generateStronghold = (lvl: number) => {
     const grid: Tile[] = [];
-    
+
     for (let r = 0; r < MAP_ROWS; r++) {
       for (let c = 0; c < MAP_COLS; c++) {
         let type: TileType = "floor";
@@ -149,22 +167,22 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           // Create walls at column intervals to break the area into 3 distinct vertical zones
           const inHorizontalBorder = (r === 0 || r === MAP_ROWS - 1);
           const inVerticalBorder = (c === MAP_COLS - 1);
-          
+
           const inDividingWall1 = (c === 10 && !(r >= 4 && r <= 6) && !(r >= 12 && r <= 14));
           const inDividingWall2 = (c === 16 && !(r >= 2 && r <= 4) && !(r >= 13 && r <= 15));
 
           const inCorridorBlock1 = (r === 5 && c > 4 && c < 10 && c !== 7);
           const inCorridorBlock2 = (r === 12 && c > 10 && c < 16 && c !== 13);
-          
+
           if (inHorizontalBorder || inVerticalBorder || inDividingWall1 || inDividingWall2 || inCorridorBlock1 || inCorridorBlock2) {
             type = "wall";
           } else {
             // Check barrel cluster placements for path blockages
             const isBarrelPosition = (
-              (c === 7 && r === 7) || 
-              (c === 8 && r === 7) || 
-              (c === 13 && r === 3) || 
-              (c === 14 && r === 8) || 
+              (c === 7 && r === 7) ||
+              (c === 8 && r === 7) ||
+              (c === 13 && r === 3) ||
+              (c === 14 && r === 8) ||
               (c === 18 && r === 12) ||
               (c === 20 && r === 5)
             );
@@ -241,33 +259,63 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     // Position of boat
     boatRef.current = { x: 80, y: 360 };
 
-    // Spawn Frog in intermediate room 1 or 2 randomly
-    const frogSpawnRooms = [
-      { x: 320, y: 160 },
-      { x: 360, y: 520 },
-      { x: 520, y: 240 },
-      { x: 560, y: 440 }
+    // Spawn Frogs — TWO frogs for reliable key progression
+    // Frog A: near the stronghold entrance (easy to find early)
+    // Frog B: deeper inside (rewards exploration)
+    const frogASpawns = [
+      { x: 240, y: 320 },
+      { x: 280, y: 440 },
+      { x: 240, y: 200 },
     ];
-    const pickedFrog = frogSpawnRooms[Math.floor(Math.random() * frogSpawnRooms.length)];
+    const frogBSpawns = [
+      { x: 520, y: 240 },
+      { x: 560, y: 440 },
+      { x: 680, y: 320 },
+    ];
+    const pickedFrogA = frogASpawns[Math.floor(Math.random() * frogASpawns.length)];
+    const pickedFrogB = frogBSpawns[Math.floor(Math.random() * frogBSpawns.length)];
+
+    // Primary frog (tracked by frogRef)
     frogRef.current = {
-      x: pickedFrog.x,
-      y: pickedFrog.y,
-      radius: 14,
-      hitsRequired: 2 + Math.floor(lvl / 3),
+      x: pickedFrogA.x,
+      y: pickedFrogA.y,
+      radius: 20,
+      hitsRequired: 1 + Math.floor(lvl / 4),
       escapesRemaining: 3,
       magicalCharge: 0
     };
 
-    // Spawn Locked chests (Upgrades - contents randomized on open)
+    // Bonus frog keys already on the ground — spread across the map
+    // Simulates multiple frogs that already dropped their keys
+    const bonusKeyPositions = [
+      { x: pickedFrogB.x, y: pickedFrogB.y },       // mid-room frog
+      { x: 360, y: 200 },                            // near upper corridor
+      { x: 760, y: 520 },                            // deep vault area
+    ];
+    keyPickupsRef.current = bonusKeyPositions.map((pos, i) => ({
+      id: `frog_bonus_key_${lvl}_${i}`,
+      x: pos.x,
+      y: pos.y,
+      collected: false
+    }));
+
+    // Spawn Locked chests — one near gate for fast early progression
     chestsRef.current = [
-      { id: "chest_1", x: 280, y: 120, opened: false, upgradeType: "score", upgradeName: "" },
+      { id: "chest_1", x: 240, y: 360, opened: false, upgradeType: "score", upgradeName: "" },
       { id: "chest_2", x: 600, y: 120, opened: false, upgradeType: "score", upgradeName: "" },
       { id: "chest_3", x: 880, y: 640, opened: false, upgradeType: "score", upgradeName: "" },
       { id: "chest_4", x: 680, y: 600, opened: false, upgradeType: "score", upgradeName: "" },
     ];
 
-    // Spawn Keys: originally empty, dropped by frog
-    keyPickupsRef.current = [];
+    // Initialize chest animation states
+    const chestAnims: Record<string, { frame: number, timer: number, openAnimPlaying: boolean, openAnimDone: boolean }> = {};
+    chestsRef.current.forEach(c => {
+      chestAnims[c.id] = { frame: 0, timer: 0, openAnimPlaying: false, openAnimDone: false };
+    });
+    chestAnimRef.current = chestAnims;
+
+    // Spawn Keys: bonus frog key already placed above, frog drops more on hit
+    // (keyPickupsRef already initialized above with bonus key)
 
     // Spawn Cursed Artifact deep inside vault
     artifactRef.current = {
@@ -277,25 +325,31 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       pulseTimer: 0
     };
 
-    // Enemies generation with scaling patrol vectors
+    // Enemies generation — starts gentle, scales with level
     const enemiesToSpawn: Enemy[] = [];
-    const baseCount = 2;
+    const baseCount = 1; // Only 1 enemy at level 1!
     const maxEnemies = Math.min(6, baseCount + Math.floor(lvl / 2));
 
     // Dynamic paths for patrols
     const paths = [
-      [ { x: 280, y: 240 }, { x: 280, y: 480 } ],
-      [ { x: 520, y: 160 }, { x: 520, y: 560 } ],
-      [ { x: 720, y: 240 }, { x: 720, y: 480 } ],
-      [ { x: 640, y: 480 }, { x: 880, y: 480 } ],
-      [ { x: 160, y: 120 }, { x: 400, y: 120 } ],
-      [ { x: 680, y: 160 }, { x: 880, y: 160 } ]
+      [{ x: 280, y: 240 }, { x: 280, y: 480 }],
+      [{ x: 520, y: 160 }, { x: 520, y: 560 }],
+      [{ x: 720, y: 240 }, { x: 720, y: 480 }],
+      [{ x: 640, y: 480 }, { x: 880, y: 480 }],
+      [{ x: 160, y: 120 }, { x: 400, y: 120 }],
+      [{ x: 680, y: 160 }, { x: 880, y: 160 }]
     ];
 
     for (let i = 0; i < maxEnemies; i++) {
       const chosenPath = paths[i % paths.length];
       const startNode = chosenPath[0];
-      const patrolSpeed = 1.0 + Math.min(1.5, lvl * 0.15) + (Math.random() * 0.3);
+      // Difficulty-scaled patrol speed:
+      // Level 1: ~0.5-0.7 (slow, readable patrols)
+      // Level 3-5: ~0.9-1.3 (moderate pressure)
+      // Level 6+: ~1.4-2.0 (intense stealth chaos)
+      const baseSpeed = 0.4;
+      const levelScaling = Math.min(1.6, lvl * 0.2);
+      const patrolSpeed = baseSpeed + levelScaling + (Math.random() * 0.2);
 
       enemiesToSpawn.push({
         id: `enemy_${i}`,
@@ -313,8 +367,14 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     }
 
     enemiesRef.current = enemiesToSpawn;
+    const newAnims: Record<string, { frame: number, timer: number, isMoving: boolean }> = {};
+    enemiesToSpawn.forEach(e => {
+      newAnims[e.id] = { frame: 0, timer: 0, isMoving: false };
+    });
+    enemiesAnimRef.current = newAnims;
     floatingTextsRef.current = [];
     particlesRef.current = [];
+    progressionRef.current = "SEARCHING_FOR_FROG";
   };
 
   // Setup keys listener, make sure to add canvas focus support too
@@ -380,13 +440,13 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   // Perform strike / interaction attack check
   const playerAttack = () => {
     if (strikeCooldown.current > 0) return;
-    
+
     // Set cooldown based on active weapon
     let strikeDist = 45;
     let weaponDmg = 1;
     let particlesColor = "#a7f3d0";
 
-    switch(activeWeapon) {
+    switch (activeWeapon) {
       case "Wooden Dagger":
         strikeCooldown.current = 24;
         strikeDist = 55;
@@ -412,7 +472,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
     sound.playFootstep(); // play whoosh swing thud
     const p = playerRef.current;
-    
+
     // Directional vector offset
     let targetX = p.x;
     let targetY = p.y;
@@ -430,6 +490,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       sound.playFrogHit();
       spawnParticles(f.x, f.y, "#22c55e", 15);
       spawnFloatingText(f.x, f.y, "-RIBBIT!-", "#4ade80");
+      frogAnimRef.current.hitTimer = 30;
 
       if (f.hitsRequired <= 0) {
         // Frog drops key!
@@ -442,7 +503,8 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         });
         spawnParticles(f.x, f.y, "#eab308", 20);
         spawnFloatingText(f.x, f.y, "+1 Key Dropped", "#facc15");
-        
+        progressionRef.current = "KEY_OBTAINED";
+
         // Relocate frog
         const frogSpawns = [
           { x: 300, y: 160 },
@@ -451,7 +513,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           { x: 800, y: 440 },
           { x: 480, y: 360 }
         ];
-        
+
         // Find a spot far from the player
         let bestSpot = frogSpawns[0];
         let maxDist = 0;
@@ -466,7 +528,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         // Set frog characteristics for next cycle with scaling
         f.x = bestSpot.x;
         f.y = bestSpot.y;
-        f.hitsRequired = 2 + Math.floor(level / 3);
+        f.hitsRequired = 1 + Math.floor(level / 4);
         f.magicalCharge = 40; // give it a sparkly bubble effect when teleporting!
       } else {
         // Make the frog hop to a random adjacent tile corridor to escape
@@ -486,14 +548,21 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         if (!chest.opened) {
           const distToChest = Math.hypot(p.x - chest.x, p.y - chest.y);
           if (distToChest <= strikeDist) {
-            if (keysCount > 0) {
+            if (keysCount > 0 && progressionRef.current === "KEY_OBTAINED") {
               chest.opened = true;
+              // Trigger chest open animation
+              const cAnim = chestAnimRef.current[chest.id];
+              if (cAnim) {
+                cAnim.openAnimPlaying = true;
+                cAnim.frame = 4; // First opening frame
+                cAnim.timer = 0;
+              }
               setKeysCount(prev => prev - 1);
               sound.playChestOpen();
               spawnParticles(chest.x, chest.y, "#ffd700", 30);
-              
+
               // Determine random upgrade logically
-              const pool: Array<{type: any, name: string}> = [];
+              const pool: Array<{ type: any, name: string }> = [];
               if (speedMultiplier < 1.6) pool.push({ type: "speed", name: "Swashbuckler Boots (+Speed)" });
               if (visionMultiplier < 1.8) pool.push({ type: "vision", name: "Brass Spyglass (+Vision)" });
               if (!isSilenced) pool.push({ type: "silence", name: "Shadow Cloak (+Stealth)" });
@@ -509,8 +578,14 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
               chest.upgradeName = randomUpgrade.name;
 
               spawnFloatingText(chest.x, chest.y - 15, "Unlocked!", "#fbbf24");
-              
+
               applyChestUpgrade(chest.upgradeType, chest.upgradeName);
+
+              progressionRef.current = "CHEST_UNLOCKED";
+              progressionRef.current = "ARTIFACT_ACTIVE";
+              spawnFloatingText(p.x, p.y - 40, "ARTIFACT UNLOCKED!", "#a855f7");
+            } else if (keysCount > 0) {
+              spawnFloatingText(chest.x, chest.y - 15, "Locked by Frog!", "#ef4444");
             } else {
               spawnFloatingText(chest.x, chest.y - 10, "Needs Key!", "#f87171");
             }
@@ -568,6 +643,12 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
+    // Disable image smoothing for crisp pixel-art sprites
+    ctx.imageSmoothingEnabled = false;
+    (ctx as any).mozImageSmoothingEnabled = false;
+    (ctx as any).webkitImageSmoothingEnabled = false;
+    (ctx as any).msImageSmoothingEnabled = false;
+
     const updateGame = () => {
       if (status !== "playing") return;
 
@@ -584,7 +665,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         playerAttack();
         keys[" "] = false; // ensure single trigger per heavy tap
       }
-      
+
       // Determine movement vector
       let dx = 0;
       let dy = 0;
@@ -609,6 +690,21 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       let finalSpeed = p.speed * speedMultiplier;
       if (p.hasArtifact) {
         finalSpeed *= 0.75; // Slower when carrying the heavy glowing artifact!
+      }
+
+      // Update sprite animation
+      const pAnim = playerAnimRef.current;
+      if (dx !== 0 || dy !== 0) {
+        pAnim.isMoving = true;
+        pAnim.timer++;
+        if (pAnim.timer > 6) { // 6 frames per animation step
+          pAnim.frame = (pAnim.frame + 1) % 6; // 6 run frames (or wraps for 4 idle frames via renderer)
+          pAnim.timer = 0;
+        }
+      } else {
+        pAnim.isMoving = false;
+        pAnim.frame = 0; // idle frame
+        pAnim.timer = 0;
       }
 
       // Normalise speed vector
@@ -637,7 +733,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       keyPickupsRef.current.forEach(kp => {
         if (!kp.collected) {
           const d = Math.hypot(p.x - kp.x, p.y - kp.y);
-          if (d <= p.radius + 10) {
+          if (d <= p.radius + 18) {
             kp.collected = true;
             setKeysCount(prev => prev + 1);
             sound.playKeyPickup();
@@ -649,23 +745,31 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
       // Check pickup artifact goblet
       const art = artifactRef.current;
-      if (!art.collected) {
+      if (!art.collected && progressionRef.current === "ARTIFACT_ACTIVE") {
         const d = Math.hypot(p.x - art.x, p.y - art.y);
-        if (d <= p.radius + 12) {
+        if (d <= p.radius + 20) {
           art.collected = true;
           p.hasArtifact = true;
+          progressionRef.current = "ARTIFACT_STOLEN";
+          progressionRef.current = "ESCAPE_ACTIVE";
           sound.playArtifactPickup();
           spawnParticles(art.x, art.y, "#9333ea", 40);
-          spawnFloatingText(art.x, art.y, "CURSED ARTIFAC SEIZED!", "#a855f7");
+          spawnFloatingText(art.x, art.y, "CURSED ARTIFACT SEIZED!", "#a855f7");
           spawnFloatingText(art.x, art.y - 20, "ESCAPE TO THE BOAT!", "#f43f5e");
+        }
+      } else if (!art.collected && progressionRef.current !== "ARTIFACT_ACTIVE") {
+        const d = Math.hypot(p.x - art.x, p.y - art.y);
+        if (d <= p.radius + 20 && Math.random() < 0.02) {
+          spawnFloatingText(art.x, art.y - 20, "Locked! Open a chest!", "#ef4444");
         }
       }
 
       // Check escape boat extraction
-      if (p.hasArtifact) {
+      if (p.hasArtifact && progressionRef.current === "ESCAPE_ACTIVE") {
         const dToBoat = Math.hypot(p.x - boatRef.current.x, p.y - boatRef.current.y);
-        if (dToBoat <= 35) {
+        if (dToBoat <= 40) {
           // SUCCESSFULLY ESCAPED OUT! Increment score & restart round
+          progressionRef.current = "ROUND_COMPLETE";
           sound.playExtractionVictory();
           setScore(prev => prev + 100 * level);
           setLevel(prev => prev + 1);
@@ -681,10 +785,13 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         const targetNode = enemy.patrolPath[enemy.pathIdx];
         const distToNode = Math.hypot(enemy.x - targetNode.x, enemy.y - targetNode.y);
 
+        let isMoving = false;
+
         if (enemy.state === "patrol") {
           if (distToNode <= 5) {
             enemy.pathIdx = (enemy.pathIdx + 1) % enemy.patrolPath.length;
           } else {
+            isMoving = true;
             // Face and walk smoothly to the target cell point
             const angle = Math.atan2(targetNode.y - enemy.y, targetNode.x - enemy.x);
             enemy.direction = angle;
@@ -692,49 +799,70 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
             enemy.y += Math.sin(angle) * enemy.speed;
           }
         } else if (enemy.state === "investigate") {
-          // Walk carefully to search site targetX / targetY
+          // Walk cautiously toward search site — SLOWER than patrol to feel fair
           if (enemy.targetX && enemy.targetY) {
             const distToSearchSpot = Math.hypot(enemy.x - enemy.targetX, enemy.y - enemy.targetY);
             if (distToSearchSpot <= 10) {
               enemy.waitTicks++;
               enemy.direction += 0.05; // look around
-              if (enemy.waitTicks > 120) {
-                // Return to normal patrol
+              if (enemy.waitTicks > 60) {
+                // Give up quickly — return to normal patrol
                 enemy.state = "patrol";
                 enemy.waitTicks = 0;
               }
             } else {
+              isMoving = true;
               const angle = Math.atan2(enemy.targetY - enemy.y, enemy.targetX - enemy.x);
               enemy.direction = angle;
-              enemy.x += Math.cos(angle) * (enemy.speed * 1.2);
-              enemy.y += Math.sin(angle) * (enemy.speed * 1.2);
+              // Investigation speed is SLOWER than patrol (cautious approach, not aggressive chase)
+              enemy.x += Math.cos(angle) * (enemy.speed * 0.9);
+              enemy.y += Math.sin(angle) * (enemy.speed * 0.9);
+            }
+          }
+        }
+
+        const eAnim = enemiesAnimRef.current[enemy.id];
+        if (eAnim) {
+          eAnim.isMoving = isMoving;
+          if (isMoving) {
+            eAnim.timer++;
+            if (eAnim.timer > 6) { // 6 frames per step
+              eAnim.frame = (eAnim.frame + 1) % 13; // 13 walk frames
+              eAnim.timer = 0;
+            }
+          } else {
+            eAnim.timer++;
+            if (eAnim.timer > 12) { // slower idle breathing cycle
+              eAnim.frame = (eAnim.frame + 1) % 7; // cycle idle frames
+              eAnim.timer = 0;
             }
           }
         }
 
         // Sight check: does enemy sight cone spot player?
         const distToPlayer = Math.hypot(enemy.x - p.x, enemy.y - p.y);
-        const maxVisionRange = 170 + (playerRef.current.hasArtifact ? 40 : 0); // higher detection range if carrying artifact!
+        // Vision range: 130px base (was 170), +40 if player carries artifact
+        const maxVisionRange = 130 + (playerRef.current.hasArtifact ? 40 : 0);
 
         if (distToPlayer <= maxVisionRange) {
-          // Check angle bounds
+          // Check angle bounds — narrower cone for fairness
           const angleToPlayer = Math.atan2(p.y - enemy.y, p.x - enemy.x);
           const angleDiff = Math.abs(Math.atan2(Math.sin(angleToPlayer - enemy.direction), Math.cos(angleToPlayer - enemy.direction)));
-          
-          const coneHaff = Math.PI / 4; // 45 degree vision cone on each side
+
+          const coneHaff = Math.PI / 5; // ~36 degree vision cone each side (was 45)
           if (angleDiff <= coneHaff) {
             // Player is in vision cone! Check grid obstacle blockage so we can hide behind crates
             let hasLineOfSight = true;
-            
+
             // Cast ray to detect blocking dungeon blocks
             const raySteps = 15;
             for (let i = 1; i < raySteps; i++) {
               const checkX = enemy.x + (p.x - enemy.x) * (i / raySteps);
               const checkY = enemy.y + (p.y - enemy.y) * (i / raySteps);
-              
+
               const gCol = Math.floor(checkX / TILE_SIZE);
               const gRow = Math.floor(checkY / TILE_SIZE);
-              
+
               const solidTile = tilesRef.current.find(t => t.x === gCol && t.y === gRow);
               if (solidTile && (solidTile.type === "wall" || solidTile.type === "barrel")) {
                 hasLineOfSight = false;
@@ -748,21 +876,47 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
               enemy.targetX = p.x;
               enemy.targetY = p.y;
               enemy.waitTicks = 0;
-              
-              if (enemy.alertProgress < 100) {
-                // Raise speed of panic bar
-                let raiseVel = 1.4;
-                if (isSilenced) raiseVel *= 0.65; // quieter boots slow panic
-                setPanicValue(prev => Math.min(100, prev + raiseVel));
+
+              // Grace period: enemy needs time to "recognize" the player
+              // Level 1: ~30 frames (~0.5s) of grace before panic builds
+              // Level 6+: ~10 frames (~0.17s) — near-instant detection
+              const graceThreshold = Math.max(10, 35 - level * 4);
+              detectionGraceRef.current++;
+
+              if (detectionGraceRef.current >= graceThreshold) {
+                // Play alert sound once when grace period ends
+                if (!alertSoundPlayedRef.current) {
+                  sound.playAlert();
+                  alertSoundPlayedRef.current = true;
+                }
+
+                if (enemy.alertProgress < 100) {
+                  // Panic raise scales with level:
+                  // Level 1: ~0.5 (very forgiving, brief sightings survivable)
+                  // Level 3: ~1.1 (noticeable pressure)
+                  // Level 6+: ~2.0-2.7 (punishing, lingering = death)
+                  let raiseVel = 0.3 + Math.min(2.4, level * 0.35);
+                  if (isSilenced) raiseVel *= 0.55;
+                  setPanicValue(prev => Math.min(100, prev + raiseVel));
+                }
               }
             }
           }
         }
       });
 
-      // Slowly lower panic value if player is hidden
+      // Panic decay when hidden — fast early, slow late
+      // Level 1: 0.5 (quick recovery, mistakes are forgiving)
+      // Level 3: 0.35 (moderate recovery)
+      // Level 6+: 0.15 (panic lingers, demands precision)
       if (!anyEnemyDetectsPlayer) {
-        setPanicValue(prev => Math.max(0, prev - 0.2));
+        const panicDecay = Math.max(0.1, 0.6 - level * 0.07);
+        setPanicValue(prev => Math.max(0, prev - panicDecay));
+        alertSoundPlayedRef.current = false;
+        // Grace timer drains when hidden (but not instantly — simulates enemy suspicion fading)
+        if (detectionGraceRef.current > 0) {
+          detectionGraceRef.current = Math.max(0, detectionGraceRef.current - 2);
+        }
       }
 
       // Check panic limit for Game Over state
@@ -783,8 +937,37 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       if (frogRef.current.magicalCharge > 0) {
         frogRef.current.magicalCharge--;
       }
-      
+      if (frogAnimRef.current.hitTimer > 0) {
+        frogAnimRef.current.hitTimer--;
+      }
+
       artifactRef.current.pulseTimer += 0.05;
+
+      // Chest animation ticks
+      chestsRef.current.forEach(chest => {
+        const cAnim = chestAnimRef.current[chest.id];
+        if (!cAnim) return;
+
+        cAnim.timer++;
+        if (cAnim.openAnimPlaying) {
+          // Opening animation: frames 4-7, one-shot
+          if (cAnim.timer > 8) {
+            cAnim.timer = 0;
+            cAnim.frame++;
+            if (cAnim.frame >= 8) {
+              cAnim.frame = 7; // Stay on final open frame
+              cAnim.openAnimPlaying = false;
+              cAnim.openAnimDone = true;
+            }
+          }
+        } else if (!chest.opened) {
+          // Idle shimmer: cycle frames 0-3
+          if (cAnim.timer > 10) {
+            cAnim.timer = 0;
+            cAnim.frame = (cAnim.frame + 1) % 4;
+          }
+        }
+      });
 
       // Floating text animations
       floatingTextsRef.current.forEach(ft => {
@@ -798,6 +981,11 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
       // 1. Draw the floor tiles layer deterministically
+      let floorPattern: CanvasPattern | null = null;
+      if (images.floor.complete && images.floor.naturalWidth > 0) {
+        floorPattern = ctx.createPattern(images.floor, "repeat");
+      }
+
       tilesRef.current.forEach(tile => {
         const tx = tile.x * TILE_SIZE;
         const ty = tile.y * TILE_SIZE;
@@ -857,11 +1045,16 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
             ctx.fillRect(tx, ty, TILE_SIZE, TILE_SIZE);
             break;
           default: // interior walk floor
-            ctx.fillStyle = "#18181b";
-            ctx.fillRect(tx, ty, TILE_SIZE, TILE_SIZE);
-            ctx.strokeStyle = "#27272a";
-            ctx.lineWidth = 1;
-            ctx.strokeRect(tx, ty, TILE_SIZE, TILE_SIZE);
+            if (floorPattern) {
+              ctx.fillStyle = floorPattern;
+              ctx.fillRect(tx, ty, TILE_SIZE, TILE_SIZE);
+            } else {
+              ctx.fillStyle = "#18181b";
+              ctx.fillRect(tx, ty, TILE_SIZE, TILE_SIZE);
+              ctx.strokeStyle = "#27272a";
+              ctx.lineWidth = 1;
+              ctx.strokeRect(tx, ty, TILE_SIZE, TILE_SIZE);
+            }
             break;
         }
       });
@@ -869,6 +1062,17 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       // 2. Draw Docked Escape Pirate Sloop/Boat in beach dock zone
       const bX = boatRef.current.x;
       const bY = boatRef.current.y;
+      const isEscapeActive = progressionRef.current === "ESCAPE_ACTIVE" && playerRef.current.hasArtifact;
+
+      // Glow changes when escape is active — green pulsing beacon
+      if (isEscapeActive) {
+        ctx.shadowColor = "#22c55e";
+        ctx.shadowBlur = 25 + Math.sin(Date.now() / 150) * 10;
+      } else {
+        ctx.shadowColor = "#3b82f6";
+        ctx.shadowBlur = 15;
+      }
+
       ctx.fillStyle = "#78350f";
       // Boat Hull shape
       ctx.beginPath();
@@ -881,7 +1085,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       ctx.fill();
 
       // Boat mast or sail
-      ctx.fillStyle = "#f3f4f6";
+      ctx.fillStyle = isEscapeActive ? "#bbf7d0" : "#f3f4f6";
       ctx.beginPath();
       ctx.moveTo(bX - 5, bY - 10);
       ctx.lineTo(bX + 10, bY);
@@ -889,110 +1093,156 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       ctx.closePath();
       ctx.fill();
 
+      ctx.shadowBlur = 0; // reset
+
       // Draw the Cursed Artifact pedestal in deep stronghold if not collected
       const art = artifactRef.current;
       if (!art.collected) {
+        // Larger pedestal for readability
         ctx.fillStyle = "#1f2937";
-        ctx.fillRect(art.x - 14, art.y - 14, 28, 28);
+        ctx.fillRect(art.x - 18, art.y - 18, 36, 36);
         ctx.strokeStyle = "#4b5563";
-        ctx.strokeRect(art.x - 14, art.y - 14, 28, 28);
+        ctx.lineWidth = 2;
+        ctx.strokeRect(art.x - 18, art.y - 18, 36, 36);
 
-        // Pulsing mysterious jewel
+        // Pulsing mysterious jewel — larger core
         const pulseRatio = Math.sin(art.pulseTimer * 4) * 3;
-        ctx.shadowColor = "#a855f7";
-        ctx.shadowBlur = 15;
-        ctx.fillStyle = "#c084fc";
+        ctx.shadowColor = progressionRef.current === "ARTIFACT_ACTIVE" ? "#a855f7" : "#fbbf24";
+        ctx.shadowBlur = 30 + pulseRatio * 3;
+        ctx.fillStyle = "#c084fc"; // Purple core
         ctx.beginPath();
-        ctx.arc(art.x, art.y, 7 + pulseRatio, 0, Math.PI * 2);
+        ctx.arc(art.x, art.y, 10 + pulseRatio, 0, Math.PI * 2);
         ctx.fill();
         ctx.shadowBlur = 0; // reset
       }
 
-      // 3. Draw Locked Upgrade Chests
-      chestsRef.current.forEach(chest => {
-        if (!chest.opened) {
-          // Closed Brown treasure box chest
-          ctx.fillStyle = "#d97706";
-          ctx.fillRect(chest.x - 15, chest.y - 10, 30, 20);
-          ctx.strokeStyle = "#78350f";
-          ctx.lineWidth = 2;
-          ctx.strokeRect(chest.x - 15, chest.y - 10, 30, 20);
+      // 3. Draw Animated Chests (spritesheet: 240x256, 8 cols x 8 rows, 30x32 per frame)
+      const chestImg = images.chestSheet;
+      const CHEST_COLS = 8;
+      const CHEST_FRAME_W = 30; // 240 / 8
+      const CHEST_FRAME_H = 32; // 256 / 8
+      const CHEST_ROW = 3;      // Gold ornate chest row
+      const CHEST_DEST = 48;    // Rendered size on canvas
 
-          // Iron lock highlight
-          ctx.fillStyle = "#ef4444";
-          ctx.fillRect(chest.x - 4, chest.y - 2, 8, 8);
+      chestsRef.current.forEach(chest => {
+        const cAnim = chestAnimRef.current[chest.id] || { frame: 0, timer: 0, openAnimPlaying: false, openAnimDone: false };
+
+        // Warm gold glow — brighter when closed for visibility in darkness
+        ctx.shadowColor = "#fbbf24";
+        ctx.shadowBlur = chest.opened ? 6 : 14 + Math.sin(Date.now() / 200) * 4;
+
+        if (chestImg.complete && chestImg.naturalWidth > 0) {
+          // Slice the correct frame from the spritesheet
+          const col = cAnim.frame % CHEST_COLS;
+          const sx = col * CHEST_FRAME_W;
+          const sy = CHEST_ROW * CHEST_FRAME_H;
+
+          ctx.drawImage(
+            chestImg,
+            sx, sy, CHEST_FRAME_W, CHEST_FRAME_H,
+            chest.x - CHEST_DEST / 2, chest.y - CHEST_DEST / 2, CHEST_DEST, CHEST_DEST
+          );
         } else {
-          // Opened gold leaking state
-          ctx.fillStyle = "#451a03";
-          ctx.fillRect(chest.x - 15, chest.y - 10, 30, 10);
-          ctx.fillStyle = "#fbbf24";
-          ctx.fillRect(chest.x - 15, chest.y, 30, 10);
+          // Fallback primitives if spritesheet failed to load
+          if (!chest.opened) {
+            ctx.fillStyle = "#d97706";
+            ctx.fillRect(chest.x - 15, chest.y - 10, 30, 20);
+            ctx.strokeStyle = "#78350f";
+            ctx.lineWidth = 2;
+            ctx.strokeRect(chest.x - 15, chest.y - 10, 30, 20);
+            ctx.fillStyle = "#ef4444";
+            ctx.fillRect(chest.x - 4, chest.y - 2, 8, 8);
+          } else {
+            ctx.fillStyle = "#451a03";
+            ctx.fillRect(chest.x - 15, chest.y - 10, 30, 10);
+            ctx.fillStyle = "#fbbf24";
+            ctx.fillRect(chest.x - 15, chest.y, 30, 10);
+          }
         }
+
+        ctx.shadowBlur = 0; // reset
       });
 
-      // 4. Draw key pickups on ground
+      // 4. Draw key pickups on ground — with glow and pulse
       keyPickupsRef.current.forEach(kp => {
         if (!kp.collected) {
+          const keyPulse = Math.sin(Date.now() / 200) * 2;
+          ctx.shadowColor = "#fbbf24";
+          ctx.shadowBlur = 12 + keyPulse;
+
           ctx.fillStyle = "#fbbf24";
           ctx.beginPath();
-          ctx.arc(kp.x, kp.y, 5, 0, Math.PI * 2);
+          ctx.arc(kp.x, kp.y, 8 + keyPulse / 2, 0, Math.PI * 2);
           ctx.fill();
           // Draw metallic stem
+          ctx.strokeStyle = "#fde68a";
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.moveTo(kp.x, kp.y);
+          ctx.lineTo(kp.x + 10, kp.y + 5);
+          ctx.stroke();
+          // Key teeth
           ctx.strokeStyle = "#fbbf24";
           ctx.lineWidth = 2;
           ctx.beginPath();
-          ctx.moveTo(kp.x, kp.y);
-          ctx.lineTo(kp.x + 8, kp.y + 4);
+          ctx.moveTo(kp.x + 10, kp.y + 5);
+          ctx.lineTo(kp.x + 10, kp.y + 9);
+          ctx.moveTo(kp.x + 8, kp.y + 5);
+          ctx.lineTo(kp.x + 8, kp.y + 8);
           ctx.stroke();
+
+          ctx.shadowBlur = 0;
         }
       });
 
       // 5. Draw magical Giga-Frog God
       const f = frogRef.current;
       const chargePulse = Math.sin(Date.now() / 100) * 2;
-      
-      if (f.magicalCharge > 0) {
-        ctx.shadowColor = "#22c55e";
-        ctx.shadowBlur = f.magicalCharge / 2;
-      }
-      
+
+      ctx.shadowColor = "#4ade80"; // Bright magical green frog glow
+      ctx.shadowBlur = f.magicalCharge > 0 ? f.magicalCharge : 12; // Always glow a bit
+
       // Frog Green base body
-      ctx.fillStyle = "#16a34a";
-      ctx.beginPath();
-      ctx.arc(f.x, f.y, f.radius + chargePulse, 0, Math.PI * 2);
-      ctx.fill();
+      const fAnim = frogAnimRef.current;
+      const bobY = Math.sin(Date.now() / 150) * 2;
 
-      // Giant yellow vocal sac chins
-      ctx.fillStyle = "#facc15";
-      ctx.beginPath();
-      ctx.arc(f.x, f.y + 6, f.radius - 4, 0, Math.PI);
-      ctx.fill();
+      let frogImg = images.frog_idle;
+      if (fAnim.hitTimer > 0 || f.magicalCharge > 0) {
+        frogImg = images.frog_key;
+      }
 
-      // Shiny big goofy eyes
-      ctx.fillStyle = "#ffffff";
-      ctx.beginPath();
-      ctx.arc(f.x - 6, f.y - 7, 4, 0, Math.PI * 2);
-      ctx.arc(f.x + 6, f.y - 7, 4, 0, Math.PI * 2);
-      ctx.fill();
+      if (frogImg.complete && frogImg.naturalWidth > 0) {
+        // Single-frame sprites — scale for visibility
+        const FROG_DEST = 64;
+        const destSize = FROG_DEST + chargePulse;
 
-      ctx.fillStyle = "#000000";
-      ctx.beginPath();
-      ctx.arc(f.x - 6, f.y - 7, 2, 0, Math.PI * 2);
-      ctx.arc(f.x + 6, f.y - 7, 2, 0, Math.PI * 2);
-      ctx.fill();
+        ctx.drawImage(
+          frogImg,
+          0, 0, frogImg.naturalWidth, frogImg.naturalHeight,
+          f.x - destSize / 2,
+          f.y - destSize / 2 + bobY,
+          destSize,
+          destSize
+        );
+      } else {
+        // Fallback
+        ctx.fillStyle = (fAnim.hitTimer > 0 || f.magicalCharge > 0) ? "#15803d" : "#16a34a";
+        ctx.beginPath();
+        ctx.arc(f.x, f.y + bobY, f.radius + chargePulse, 0, Math.PI * 2);
+        ctx.fill();
+      }
 
       ctx.shadowBlur = 0; // reset
 
       // 6. Draw Guard vision cones & Alert Indicators
       enemiesRef.current.forEach(enemy => {
         // Draw vision cone gradient
-        const vRadius = 150 + (playerRef.current.hasArtifact ? 40 : 0);
-        const coneH = Math.PI / 4;
+        const vRadius = 130 + (playerRef.current.hasArtifact ? 40 : 0);
+        const coneH = Math.PI / 5;
 
-        ctx.fillStyle = "rgba(245, 158, 11, 0.12)";
-        if (enemy.state === "investigate") {
-          ctx.fillStyle = "rgba(239, 68, 68, 0.2)";
-        }
+        ctx.shadowColor = enemy.state === "investigate" ? "#ef4444" : "#f59e0b";
+        ctx.shadowBlur = 10;
+        ctx.fillStyle = enemy.state === "investigate" ? "rgba(239, 68, 68, 0.25)" : "rgba(245, 158, 11, 0.15)";
 
         ctx.beginPath();
         ctx.moveTo(enemy.x, enemy.y);
@@ -1005,80 +1255,108 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         );
         ctx.closePath();
         ctx.fill();
+        ctx.shadowBlur = 0; // reset
 
-        // Draw Cursed Ghostly Skeleton Guards representation
-        ctx.fillStyle = "#e0e7ff"; // ghostly white bony body
-        ctx.beginPath();
-        ctx.arc(enemy.x, enemy.y, enemy.radius, 0, Math.PI * 2);
-        ctx.fill();
+        // Draw animated enemy sprite — individual frame images
+        const eAnim = enemiesAnimRef.current[enemy.id] || { frame: 0, isMoving: false };
 
-        // Bandana hat
-        ctx.fillStyle = "#a855f7"; // Cursed Purple bandits bandana
-        ctx.beginPath();
-        ctx.arc(enemy.x, enemy.y - 5, enemy.radius - 2, Math.PI, 0);
-        ctx.fill();
+        // Select frame array based on movement state
+        const enemyFrames = eAnim.isMoving ? images.enemyWalk : images.enemyIdle;
+        const frameIdx = eAnim.frame % enemyFrames.length;
+        const enemyFrame = enemyFrames[frameIdx];
 
-        // Glowing malicious red eye pixels
-        ctx.fillStyle = "#ef4444";
-        ctx.fillRect(enemy.x - 4, enemy.y - 2, 2, 2);
-        ctx.fillRect(enemy.x + 2, enemy.y - 2, 2, 2);
+        if (enemyFrame && enemyFrame.complete && enemyFrame.naturalWidth > 0) {
+          const ENEMY_DEST = 48;
 
-        // Saber handle weapon decoration
-        ctx.strokeStyle = "#94a3b8";
-        ctx.lineWidth = 3;
-        ctx.beginPath();
-        ctx.moveTo(enemy.x + 8, enemy.y);
-        ctx.lineTo(enemy.x + 16, enemy.y - 8);
-        ctx.stroke();
+          ctx.shadowColor = "#ef4444"; // Malicious red glow for readability
+          ctx.shadowBlur = enemy.state === "investigate" ? 18 : 8;
 
-        // Exclamation alert state notice
+          ctx.drawImage(
+            enemyFrame,
+            0, 0, enemyFrame.naturalWidth, enemyFrame.naturalHeight,
+            enemy.x - ENEMY_DEST / 2, enemy.y - ENEMY_DEST / 2, ENEMY_DEST, ENEMY_DEST
+          );
+
+          ctx.shadowBlur = 0;
+        } else {
+          // Fallback primitive
+          ctx.fillStyle = "#e0e7ff";
+          ctx.beginPath();
+          ctx.arc(enemy.x, enemy.y, enemy.radius, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        // Alert state indicator \u2014 shows ? during grace, ! during full detection
         if (enemy.state === "investigate") {
-          ctx.fillStyle = "#ef4444";
-          ctx.font = "bold 16px monospace";
-          ctx.fillText("!", enemy.x - 4, enemy.y - 16);
+          const graceThreshold = Math.max(10, 35 - level * 4);
+          if (detectionGraceRef.current < graceThreshold) {
+            // Suspicion phase \u2014 yellow "?"
+            ctx.fillStyle = "#fbbf24";
+            ctx.font = "bold 16px monospace";
+            ctx.fillText("?", enemy.x - 4, enemy.y - 16);
+          } else {
+            // Full detection \u2014 red "!"
+            ctx.fillStyle = "#ef4444";
+            ctx.font = "bold 16px monospace";
+            ctx.fillText("!", enemy.x - 4, enemy.y - 16);
+          }
         }
       });
 
-      // 7. Draw Player (Pirate)
+      // 7. Draw Player (Pirate) — individual frame sprites (3x: 120x87 each)
       const p = playerRef.current;
-      ctx.fillStyle = "#b45309"; // tanned coat
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
-      ctx.fill();
+      const pAnim = playerAnimRef.current;
 
-      // Red Tricorn Hat
-      ctx.fillStyle = "#dc2626";
-      ctx.beginPath();
-      ctx.moveTo(p.x - 14, p.y - 4);
-      ctx.lineTo(p.x + 14, p.y - 4);
-      ctx.lineTo(p.x, p.y - 15);
-      ctx.closePath();
-      ctx.fill();
+      // Select correct frame array based on movement state
+      const frameSet = pAnim.isMoving ? images.playerRun : images.playerIdle;
+      const frameIdx = pAnim.frame % frameSet.length;
+      const currentFrame = frameSet[frameIdx];
 
-      // Yellow core accent belt
-      ctx.fillStyle = "#eab308";
-      ctx.fillRect(p.x - p.radius + 3, p.y + 4, p.radius * 2 - 6, 3);
+      if (currentFrame && currentFrame.complete && currentFrame.naturalWidth > 0) {
+        // Native ratio is 40:29 — scale to ~44px wide, preserve aspect
+        const PLAYER_W = 72;
+        const PLAYER_H = Math.round(PLAYER_W * (currentFrame.naturalHeight / currentFrame.naturalWidth));
+        const flipX = p.direction === "left"; // mirror for left-facing
 
-      // Eye Patch
-      ctx.fillStyle = "#000000";
-      ctx.fillRect(p.x - 5, p.y - 3, 4, 3);
-      ctx.strokeStyle = "#000000";
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(p.x - p.radius, p.y - 6);
-      ctx.lineTo(p.x + 4, p.y + 1);
-      ctx.stroke();
+        ctx.shadowColor = "#f97316"; // Warm orange lantern glow
+        ctx.shadowBlur = 18;
 
-      // Weapon sprite according to active weapon tier
-      if (activeWeapon !== "Fists") {
-        let bladeColor = "#cbd5e1";
-        if (activeWeapon === "Cursed Cutlass") bladeColor = "#06b6d4";
-        ctx.strokeStyle = bladeColor;
-        ctx.lineWidth = 2;
+        ctx.save();
+        if (flipX) {
+          ctx.translate(p.x, p.y);
+          ctx.scale(-1, 1);
+          ctx.drawImage(
+            currentFrame,
+            0, 0, currentFrame.naturalWidth, currentFrame.naturalHeight,
+            -PLAYER_W / 2, -PLAYER_H / 2, PLAYER_W, PLAYER_H
+          );
+        } else {
+          ctx.drawImage(
+            currentFrame,
+            0, 0, currentFrame.naturalWidth, currentFrame.naturalHeight,
+            p.x - PLAYER_W / 2, p.y - PLAYER_H / 2, PLAYER_W, PLAYER_H
+          );
+        }
+        ctx.restore();
+        ctx.shadowBlur = 0; // reset
+
+        // Draw equipped weapon indicator icon next to player
+        if (activeWeapon !== "Fists") {
+          let bladeColor = "#cbd5e1";
+          if (activeWeapon === "Cursed Cutlass") bladeColor = "#06b6d4";
+          ctx.strokeStyle = bladeColor;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(p.x + 10, p.y);
+          ctx.lineTo(p.x + 18, p.y + 8);
+          ctx.stroke();
+        }
+      } else {
+        // Fallback if image isn't loaded yet
+        ctx.fillStyle = "#b45309";
         ctx.beginPath();
-        ctx.moveTo(p.x + 8, p.y + 4);
-        ctx.lineTo(p.x + 15, p.y + 11);
-        ctx.stroke();
+        ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+        ctx.fill();
       }
 
       // Glow artifact halo around the carry state sack
@@ -1191,6 +1469,73 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         ctx.font = "bold 13px monospace";
         ctx.fillText(ft.text, ft.x - ctx.measureText(ft.text).width / 2, ft.y);
       });
+
+      // 13. Interaction prompts — contextual guidance drawn on top of everything
+      const pp = playerRef.current;
+      const PROMPT_DIST = 80;
+      ctx.font = "bold 11px monospace";
+      ctx.textAlign = "center";
+
+      // Frog prompt
+      const dToFrog = Math.hypot(pp.x - frogRef.current.x, pp.y - frogRef.current.y);
+      if (dToFrog <= PROMPT_DIST && progressionRef.current === "SEARCHING_FOR_FROG") {
+        ctx.fillStyle = "#4ade80";
+        ctx.fillText("[ SPACE ] HIT FROG", frogRef.current.x, frogRef.current.y - 40);
+      }
+
+      // Key prompt
+      keyPickupsRef.current.forEach(kp => {
+        if (!kp.collected) {
+          const dToKey = Math.hypot(pp.x - kp.x, pp.y - kp.y);
+          if (dToKey <= PROMPT_DIST) {
+            ctx.fillStyle = "#fbbf24";
+            ctx.fillText("WALK OVER TO COLLECT", kp.x, kp.y - 20);
+          }
+        }
+      });
+
+      // Chest prompt
+      chestsRef.current.forEach(chest => {
+        if (!chest.opened) {
+          const dToChest = Math.hypot(pp.x - chest.x, pp.y - chest.y);
+          if (dToChest <= PROMPT_DIST) {
+            if (keysCount > 0 && progressionRef.current === "KEY_OBTAINED") {
+              ctx.fillStyle = "#fbbf24";
+              ctx.fillText("[ SPACE ] OPEN CHEST", chest.x, chest.y - 32);
+            } else {
+              ctx.fillStyle = "#ef4444";
+              ctx.fillText("\uD83D\uDD12 NEED FROG KEY", chest.x, chest.y - 32);
+            }
+          }
+        }
+      });
+
+      // Artifact prompt
+      if (!artifactRef.current.collected) {
+        const dToArt = Math.hypot(pp.x - artifactRef.current.x, pp.y - artifactRef.current.y);
+        if (dToArt <= PROMPT_DIST) {
+          if (progressionRef.current === "ARTIFACT_ACTIVE") {
+            ctx.fillStyle = "#c084fc";
+            ctx.fillText("WALK OVER TO STEAL", artifactRef.current.x, artifactRef.current.y - 28);
+          } else if (progressionRef.current !== "ESCAPE_ACTIVE" && progressionRef.current !== "ROUND_COMPLETE") {
+            ctx.fillStyle = "#ef4444";
+            ctx.fillText("\uD83D\uDD12 OPEN CHEST FIRST", artifactRef.current.x, artifactRef.current.y - 28);
+          }
+        }
+      }
+
+      // Boat extraction prompt
+      if (isEscapeActive) {
+        const dToBoat = Math.hypot(pp.x - bX, pp.y - bY);
+        if (dToBoat <= 120) {
+          const pulseAlpha = 0.7 + Math.sin(Date.now() / 150) * 0.3;
+          ctx.fillStyle = `rgba(34, 197, 94, ${pulseAlpha})`;
+          ctx.font = "bold 14px monospace";
+          ctx.fillText("\u2693 EXTRACT HERE!", bX, bY - 28);
+        }
+      }
+
+      ctx.textAlign = "start"; // reset
     };
 
     // Frame loops coupling

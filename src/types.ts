@@ -9,7 +9,16 @@ export interface Position {
 
 export type GameStatus = "start" | "playing" | "gameover" | "victory" | "level_up";
 
-export type TileType = 
+export type ProgressionState =
+  | "SEARCHING_FOR_FROG"
+  | "KEY_OBTAINED"
+  | "CHEST_UNLOCKED"
+  | "ARTIFACT_ACTIVE"
+  | "ARTIFACT_STOLEN"
+  | "ESCAPE_ACTIVE"
+  | "ROUND_COMPLETE";
+
+export type TileType =
   | "water"     // Outside ocean border
   | "dock"      // Outside walk-on dock
   | "beach"     // Sand outside stronghold

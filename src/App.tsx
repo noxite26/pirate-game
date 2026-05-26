@@ -4,6 +4,7 @@ import { HUD } from "./components/HUD";
 import { Instructions } from "./components/Instructions";
 import { GameStatus } from "./types";
 import { sound } from "./sound";
+import { preloadAssets } from "./assets";
 import { 
   Anchor, 
   Play, 
@@ -17,6 +18,7 @@ import {
 } from "lucide-react";
 
 export default function App() {
+  const [assetsLoaded, setAssetsLoaded] = useState<boolean>(false);
   const [level, setLevel] = useState<number>(1);
   const [score, setScore] = useState<number>(0);
   const [highScore, setHighScore] = useState<number>(0);
@@ -33,6 +35,16 @@ export default function App() {
   const [hasClue, setHasClue] = useState<boolean>(false);
 
   const [notification, setNotification] = useState<string | null>(null);
+
+  // Preload assets
+  useEffect(() => {
+    preloadAssets()
+      .then(() => setAssetsLoaded(true))
+      .catch((err) => {
+        console.error(err);
+        setAssetsLoaded(true); // fallback to allow play even if an image fails
+      });
+  }, []);
 
   // Load high scores locally
   useEffect(() => {
@@ -152,13 +164,20 @@ export default function App() {
             </ul>
           </div>
 
-          <button
-            onClick={handleStartGame}
-            className="w-full max-w-xs group cursor-pointer inline-flex items-center justify-center gap-2.5 px-6 py-3 border-2 border-amber-500 bg-amber-500/10 text-amber-500 font-black uppercase tracking-widest hover:bg-amber-500 hover:text-[#0a0a0a] active:scale-95 transition-all text-[11px] shadow-[0_0_15px_rgba(245,158,11,0.2)]"
-          >
-            <Play className="w-5 h-5 fill-zinc-950 text-zinc-950 group-hover:scale-110 transition-transform" />
-            Embark Captain
-          </button>
+          {assetsLoaded ? (
+            <button
+              onClick={handleStartGame}
+              className="w-full max-w-xs group cursor-pointer inline-flex items-center justify-center gap-2.5 px-6 py-3 border-2 border-amber-500 bg-amber-500/10 text-amber-500 font-black uppercase tracking-widest hover:bg-amber-500 hover:text-[#0a0a0a] active:scale-95 transition-all text-[11px] shadow-[0_0_15px_rgba(245,158,11,0.2)]"
+            >
+              <Play className="w-5 h-5 fill-zinc-950 text-zinc-950 group-hover:scale-110 transition-transform" />
+              Embark Captain
+            </button>
+          ) : (
+            <div className="w-full max-w-xs inline-flex items-center justify-center gap-2.5 px-6 py-3 border-2 border-[#3e2723] bg-[#0a0502] text-[#a1887f] font-black uppercase tracking-widest text-[11px]">
+              <RefreshCw className="w-5 h-5 animate-spin" />
+              Loading Assets...
+            </div>
+          )}
         </main>
       )}
 
