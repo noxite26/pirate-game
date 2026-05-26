@@ -1,0 +1,6 @@
+{
+  "name": "Cursed Keel",
+  "description": "A tense top-down pirate stealth-extraction game. Sneak into cursed ruins, find the magic frog to drop keys, unlock crates for upgrades, seize the jewel, and escape to your boat before panic consumes you.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
