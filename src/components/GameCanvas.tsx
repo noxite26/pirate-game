@@ -248,8 +248,8 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   };
 
   const resetEntitiesForLevel = (lvl: number) => {
-    // Player spawn: On the docks next to the small boat
-    playerRef.current.x = 90;
+    // Reset Player position and states
+    playerRef.current.x = 100;
     playerRef.current.y = 360;
     playerRef.current.hasArtifact = false;
     playerRef.current.keys = 0;
@@ -300,12 +300,16 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     }));
 
     // Spawn Locked chests — one near gate for fast early progression
-    chestsRef.current = [
-      { id: "chest_1", x: 240, y: 360, opened: false, upgradeType: "score", upgradeName: "" },
-      { id: "chest_2", x: 600, y: 120, opened: false, upgradeType: "score", upgradeName: "" },
-      { id: "chest_3", x: 880, y: 640, opened: false, upgradeType: "score", upgradeName: "" },
-      { id: "chest_4", x: 680, y: 600, opened: false, upgradeType: "score", upgradeName: "" },
+    const baseChests: Chest[] = [
+      { id: "chest_1", x: 240, y: 360, opened: false, upgradeType: "score", upgradeName: "", isTreasure: false },
+      { id: "chest_2", x: 600, y: 120, opened: false, upgradeType: "score", upgradeName: "", isTreasure: false },
+      { id: "chest_3", x: 880, y: 640, opened: false, upgradeType: "score", upgradeName: "", isTreasure: false },
+      { id: "chest_4", x: 680, y: 600, opened: false, upgradeType: "score", upgradeName: "", isTreasure: false },
     ];
+    // Randomly select one chest to be the level's treasure chest
+    const treasureIndex = Math.floor(Math.random() * baseChests.length);
+    baseChests[treasureIndex].isTreasure = true;
+    chestsRef.current = baseChests;
 
     // Initialize chest animation states
     const chestAnims: Record<string, { frame: number, timer: number, openAnimPlaying: boolean, openAnimDone: boolean }> = {};
@@ -317,10 +321,10 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     // Spawn Keys: bonus frog key already placed above, frog drops more on hit
     // (keyPickupsRef already initialized above with bonus key)
 
-    // Spawn Cursed Artifact deep inside vault
+    // Spawn Cursed Artifact hidden off-screen (will be revealed when treasure chest opens)
     artifactRef.current = {
-      x: 840,
-      y: 360,
+      x: -1000,
+      y: -1000,
       collected: false,
       pulseTimer: 0
     };
@@ -561,29 +565,41 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
               sound.playChestOpen();
               spawnParticles(chest.x, chest.y, "#ffd700", 30);
 
-              // Determine random upgrade logically
-              const pool: Array<{ type: any, name: string }> = [];
-              if (speedMultiplier < 1.6) pool.push({ type: "speed", name: "Swashbuckler Boots (+Speed)" });
-              if (visionMultiplier < 1.8) pool.push({ type: "vision", name: "Brass Spyglass (+Vision)" });
-              if (!isSilenced) pool.push({ type: "silence", name: "Shadow Cloak (+Stealth)" });
-              if (!hasClue) pool.push({ type: "clue", name: "Smuggler's Map (Reveals Jewel)" });
-              if (activeWeapon !== "Cursed Cutlass") pool.push({ type: "weapon", name: "Blacksmith Kit (+Weapon)" });
+              if (chest.isTreasure) {
+                // TREASURE CHEST: Reveal the artifact!
+                artifactRef.current.x = chest.x;
+                artifactRef.current.y = chest.y;
+                artifactRef.current.collected = false;
+                
+                progressionRef.current = "ARTIFACT_ACTIVE";
+                spawnFloatingText(p.x, p.y - 40, "TREASURE REVEALED!", "#a855f7");
+                spawnFloatingText(chest.x, chest.y - 15, "Artifact Found!", "#c084fc");
+                // The artifact is now sitting on the chest, waiting to be collected
+              } else {
+                // NORMAL CHEST: Random Upgrade
+                const pool: Array<{ type: any, name: string }> = [];
+                if (speedMultiplier < 1.6) pool.push({ type: "speed", name: "Swashbuckler Boots (+Speed)" });
+                if (visionMultiplier < 1.8) pool.push({ type: "vision", name: "Brass Spyglass (+Vision)" });
+                if (!isSilenced) pool.push({ type: "silence", name: "Shadow Cloak (+Stealth)" });
+                if (!hasClue) pool.push({ type: "clue", name: "Smuggler's Map (Reveals Jewel)" });
+                if (activeWeapon !== "Cursed Cutlass") pool.push({ type: "weapon", name: "Blacksmith Kit (+Weapon)" });
 
-              let randomUpgrade = { type: "score", name: "Pouch of Gold (+500)" };
-              if (pool.length > 0) {
-                randomUpgrade = pool[Math.floor(Math.random() * pool.length)];
+                let randomUpgrade = { type: "score", name: "Pouch of Gold (+500)" };
+                if (pool.length > 0) {
+                  randomUpgrade = pool[Math.floor(Math.random() * pool.length)];
+                }
+
+                chest.upgradeType = randomUpgrade.type;
+                chest.upgradeName = randomUpgrade.name;
+
+                spawnFloatingText(chest.x, chest.y - 15, "Unlocked!", "#fbbf24");
+                applyChestUpgrade(chest.upgradeType, chest.upgradeName);
+                
+                // Do not advance progression to ARTIFACT_ACTIVE for normal chests
+                if (progressionRef.current === "KEY_OBTAINED") {
+                  progressionRef.current = "CHEST_UNLOCKED";
+                }
               }
-
-              chest.upgradeType = randomUpgrade.type;
-              chest.upgradeName = randomUpgrade.name;
-
-              spawnFloatingText(chest.x, chest.y - 15, "Unlocked!", "#fbbf24");
-
-              applyChestUpgrade(chest.upgradeType, chest.upgradeName);
-
-              progressionRef.current = "CHEST_UNLOCKED";
-              progressionRef.current = "ARTIFACT_ACTIVE";
-              spawnFloatingText(p.x, p.y - 40, "ARTIFACT UNLOCKED!", "#a855f7");
             } else if (keysCount > 0) {
               spawnFloatingText(chest.x, chest.y - 15, "Locked by Frog!", "#ef4444");
             } else {
@@ -1511,15 +1527,12 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       });
 
       // Artifact prompt
-      if (!artifactRef.current.collected) {
+      if (!artifactRef.current.collected && artifactRef.current.x > 0) {
         const dToArt = Math.hypot(pp.x - artifactRef.current.x, pp.y - artifactRef.current.y);
         if (dToArt <= PROMPT_DIST) {
           if (progressionRef.current === "ARTIFACT_ACTIVE") {
             ctx.fillStyle = "#c084fc";
             ctx.fillText("WALK OVER TO STEAL", artifactRef.current.x, artifactRef.current.y - 28);
-          } else if (progressionRef.current !== "ESCAPE_ACTIVE" && progressionRef.current !== "ROUND_COMPLETE") {
-            ctx.fillStyle = "#ef4444";
-            ctx.fillText("\uD83D\uDD12 OPEN CHEST FIRST", artifactRef.current.x, artifactRef.current.y - 28);
           }
         }
       }
@@ -1535,6 +1548,51 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         }
       }
 
+      ctx.textAlign = "start"; // reset
+
+      // 14. Top HUD Objective Text
+      ctx.textAlign = "center";
+      ctx.font = "bold 16px monospace";
+      let objectiveText = "";
+      let objectiveColor = "#f3f4f6";
+
+      switch (progressionRef.current) {
+        case "SEARCHING_FOR_FROG":
+        case "KEY_OBTAINED":
+          objectiveText = "OBJECTIVE: Find Frogs & Keys";
+          objectiveColor = "#4ade80"; // Green
+          if (keysCount > 0) {
+            objectiveText = "OBJECTIVE: Open Chests to find Treasure";
+            objectiveColor = "#fbbf24"; // Gold
+          }
+          break;
+        case "CHEST_UNLOCKED":
+          objectiveText = "OBJECTIVE: Open Chests to find Treasure";
+          objectiveColor = "#fbbf24";
+          break;
+        case "ARTIFACT_ACTIVE":
+          objectiveText = "OBJECTIVE: Collect the Treasure!";
+          objectiveColor = "#c084fc"; // Purple
+          break;
+        case "ARTIFACT_STOLEN":
+        case "ESCAPE_ACTIVE":
+          const objPulse = 0.7 + Math.sin(Date.now() / 150) * 0.3;
+          objectiveText = "OBJECTIVE: ESCAPE WITH THE TREASURE!";
+          objectiveColor = `rgba(244, 63, 94, ${objPulse})`; // Pulsing Red
+          break;
+        case "ROUND_COMPLETE":
+          objectiveText = "LEVEL COMPLETE!";
+          objectiveColor = "#22c55e"; // Success Green
+          break;
+      }
+      
+      if (objectiveText) {
+        ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+        const textW = ctx.measureText(objectiveText).width;
+        ctx.fillRect(960 / 2 - textW / 2 - 10, 10, textW + 20, 26);
+        ctx.fillStyle = objectiveColor;
+        ctx.fillText(objectiveText, 960 / 2, 28);
+      }
       ctx.textAlign = "start"; // reset
     };
 

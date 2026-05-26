@@ -91,6 +91,7 @@ export interface Chest {
   opened: boolean;
   upgradeType: "weapon" | "speed" | "vision" | "clue" | "silence" | "score";
   upgradeName: string;
+  isTreasure?: boolean;
 }
 
 export interface Artifact {
